@@ -10,6 +10,11 @@ import {
   showZeroAxis,
   findZeroBucket,
   ScaleType,
+  validateHistogramBuckets,
+  classifyBucket,
+  calculateExpBucketWidth,
+  safeLog,
+  formatBoundary,
 } from './HistogramHelpers';
 
 interface HistogramChartProps {
@@ -23,6 +28,13 @@ const HistogramChart: FC<HistogramChartProps> = ({ index, histogram, scale }) =>
   if (!buckets || buckets.length === 0) {
     return <div>No data</div>;
   }
+
+  // Validate histogram buckets
+  const validationError = validateHistogramBuckets(buckets);
+  if (validationError) {
+    return <div style={{ padding: '10px', color: 'red' }}>{validationError}</div>;
+  }
+
   const formatter = Intl.NumberFormat('en', { notation: 'compact' });
 
   // For linear scales, the count of a histogram bucket is represented by its area rather than its height. This means it considers
@@ -59,10 +71,11 @@ const HistogramChart: FC<HistogramChartProps> = ({ index, histogram, scale }) =>
   const minNegative = parseFloat(first[1]) < 0 ? parseFloat(first[1]) : 0;
 
   // Calculate the borders of positive and negative buckets in the exponential scale from left to right
-  const startNegative = minNegative !== 0 ? -Math.log(Math.abs(minNegative)) : 0;
-  const endNegative = maxNegative !== 0 ? -Math.log(Math.abs(maxNegative)) : 0;
-  const startPositive = minPositive !== 0 ? Math.log(minPositive) : 0;
-  const endPositive = maxPositive !== 0 ? Math.log(maxPositive) : 0;
+  // Use safeLog to handle 0 and Inf cases
+  const startNegative = minNegative !== 0 ? safeLog(minNegative, true) : 0;
+  const endNegative = maxNegative !== 0 ? safeLog(maxNegative, true) : 0;
+  const startPositive = minPositive !== 0 ? safeLog(minPositive, false) : 0;
+  const endPositive = maxPositive !== 0 ? safeLog(maxPositive, false) : 0;
 
   // Calculate the width of negative, positive, and all exponential bucket ranges on the x-axis
   const xWidthNegative = endNegative - startNegative;
@@ -133,9 +146,9 @@ const HistogramChart: FC<HistogramChartProps> = ({ index, histogram, scale }) =>
         <div className="histogram-x-labels">
           <div className="histogram-x-label">
             <React.Fragment>
-              <div style={{ position: 'absolute', left: 0 }}>{formatter.format(rangeMin)}</div>
+              <div style={{ position: 'absolute', left: 0 }}>{formatBoundary(rangeMin)}</div>
               {rangeMin < 0 && zeroAxis && <div style={{ position: 'absolute', left: zeroAxisLeft }}>0</div>}
-              <div style={{ position: 'absolute', right: 0 }}>{formatter.format(rangeMax)}</div>
+              <div style={{ position: 'absolute', right: 0 }}>{formatBoundary(rangeMax)}</div>
             </React.Fragment>
           </div>
         </div>
@@ -189,9 +202,6 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
         const count = parseFloat(b[3]);
         const bucketIdx = `bucket-${index}-${bIdx}-${Math.ceil(parseFloat(b[3]) * 100)}`;
 
-        const logWidth = Math.abs(Math.log(Math.abs(right)) - Math.log(Math.abs(left)));
-        const expBucketWidth = logWidth === 0 ? defaultExpBucketWidth : logWidth;
-
         let bucketWidth = '';
         let bucketLeft = '';
         let bucketHeight = '';
@@ -206,27 +216,61 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
             }
             bucketHeight = (fds[bIdx] / fdMax) * 100 + '%';
             break;
-          case 'exponential':
+          case 'exponential': {
+            const bucketType = classifyBucket(left, right);
+
+            // Skip invalid buckets
+            if (bucketType === 'invalid') {
+              bucketLeft = '0%';
+              bucketWidth = '0%';
+              bucketHeight = '0%';
+              break;
+            }
+
+            // Calculate exponential width using helper function
+            const expBucketWidth = calculateExpBucketWidth(left, right, bucketType, defaultExpBucketWidth, buckets, bIdx);
+
             let adjust = 0; // if buckets are all positive/negative, we need to remove the width of the zero bucket
             if (minPositive === 0 || maxNegative === 0) {
               adjust = defaultExpBucketWidth;
             }
+
             bucketWidth = (expBucketWidth / (xWidthTotal - adjust)) * 100 + '%';
-            if (left < 0) {
-              // negative buckets boundary
-              bucketLeft = (-(Math.log(Math.abs(left)) + startNegative) / (xWidthTotal - adjust)) * 100 + '%';
-            } else {
-              // positive buckets boundary
+
+            // Calculate bucket position based on type
+            if (bucketType === 'zero-crossing') {
+              // Zero-crossing bucket: position at zero axis
+              bucketLeft = (xWidthNegative / xWidthTotal) * 100 + '%';
+            } else if (bucketType === 'inf-left') {
+              // -Inf boundary: position at far left (0%)
+              bucketLeft = '0%';
+            } else if (bucketType === 'inf-right') {
+              // +Inf boundary: position at far right
+              bucketLeft = ((xWidthTotal - expBucketWidth - adjust) / (xWidthTotal - adjust)) * 100 + '%';
+            } else if (bucketType === 'zero-adjacent-left') {
+              // [0, x]: position at zero axis
+              const logLeft = safeLog(0, false); // Uses 1e-10 internally
               bucketLeft =
-                ((Math.log(left) - startPositive + defaultExpBucketWidth + xWidthNegative - adjust) /
-                  (xWidthTotal - adjust)) *
+                ((logLeft - startPositive + defaultExpBucketWidth + xWidthNegative - adjust) / (xWidthTotal - adjust)) *
+                  100 +
+                '%';
+            } else if (bucketType === 'zero-adjacent-right') {
+              // [x, 0]: position such that bucket ends at zero axis
+              // Position = (xWidthNegative - expBucketWidth) / xWidthTotal
+              bucketLeft = ((xWidthNegative - expBucketWidth) / (xWidthTotal - adjust)) * 100 + '%';
+            } else if (left < 0) {
+              // Regular negative bucket
+              const logLeft = safeLog(left, true);
+              bucketLeft = (-(logLeft + startNegative) / (xWidthTotal - adjust)) * 100 + '%';
+            } else {
+              // Regular positive bucket
+              const logLeft = safeLog(left, false);
+              bucketLeft =
+                ((logLeft - startPositive + defaultExpBucketWidth + xWidthNegative - adjust) / (xWidthTotal - adjust)) *
                   100 +
                 '%';
             }
-            if (left < 0 && right > 0) {
-              // if the bucket crosses the zero axis
-              bucketLeft = (xWidthNegative / xWidthTotal) * 100 + '%';
-            }
+
             if (left === 0 && right === 0) {
               // do not render zero width zero bucket
               bucketLeft = '0%';
@@ -235,6 +279,7 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
 
             bucketHeight = (count / countMax) * 100 + '%';
             break;
+          }
           default:
             throw new Error('Invalid scale');
         }
