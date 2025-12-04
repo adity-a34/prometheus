@@ -217,7 +217,19 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
             bucketHeight = (fds[bIdx] / fdMax) * 100 + '%';
             break;
           case 'exponential': {
-            const bucketType = classifyBucket(left, right);
+            // Clamp bucket boundaries to visible range for positioning calculations
+            const clampedLeft = Math.max(left, rangeMin);
+            const clampedRight = Math.min(right, rangeMax);
+
+            // Skip buckets completely outside the visible range AFTER clamping
+            if (clampedLeft >= clampedRight) {
+              bucketLeft = '0%';
+              bucketWidth = '0%';
+              bucketHeight = '0%';
+              break;
+            }
+
+            const bucketType = classifyBucket(clampedLeft, clampedRight);
 
             // Skip invalid buckets
             if (bucketType === 'invalid') {
@@ -227,7 +239,7 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
               break;
             }
 
-            // Calculate exponential width using helper function
+            // Calculate exponential width using helper function (use original boundaries for width)
             const expBucketWidth = calculateExpBucketWidth(left, right, bucketType, defaultExpBucketWidth, buckets, bIdx);
 
             let adjust = 0; // if buckets are all positive/negative, we need to remove the width of the zero bucket
@@ -248,26 +260,30 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
               // +Inf boundary: position at far right
               bucketLeft = ((xWidthTotal - expBucketWidth - adjust) / (xWidthTotal - adjust)) * 100 + '%';
             } else if (bucketType === 'zero-adjacent-left') {
-              // [0, x]: position at zero axis
-              const logLeft = safeLog(0, false); // Uses 1e-10 internally
-              bucketLeft =
-                ((logLeft - startPositive + defaultExpBucketWidth + xWidthNegative - adjust) / (xWidthTotal - adjust)) *
-                  100 +
-                '%';
+              // [0, x]: Position at zero axis boundary (after negative range + zero bucket spacer)
+              bucketLeft = ((xWidthNegative + defaultExpBucketWidth) / (xWidthTotal - adjust)) * 100 + '%';
             } else if (bucketType === 'zero-adjacent-right') {
               // [x, 0]: position such that bucket ends at zero axis
               // Position = (xWidthNegative - expBucketWidth) / xWidthTotal
               bucketLeft = ((xWidthNegative - expBucketWidth) / (xWidthTotal - adjust)) * 100 + '%';
-            } else if (left < 0) {
+            } else if (clampedLeft < 0) {
               // Regular negative bucket
-              const logLeft = safeLog(left, true);
-              bucketLeft = (-(logLeft + startNegative) / (xWidthTotal - adjust)) * 100 + '%';
+              // Calculate position within negative range first, then map to total range
+              const logLeft = safeLog(clampedLeft, true);
+
+              // Position within [0, 1] in the negative range
+              const negativeRangePosition = (logLeft - startNegative) / xWidthNegative;
+
+              // Map to percentage of total range
+              bucketLeft = (negativeRangePosition * (xWidthNegative / (xWidthTotal - adjust))) * 100 + '%';
             } else {
               // Regular positive bucket
-              const logLeft = safeLog(left, false);
+              // Total position = (negative range) + (zero bucket) + (offset within positive range)
+              const logLeft = safeLog(clampedLeft, false);
+              const positiveOffset = logLeft - startPositive;
+
               bucketLeft =
-                ((logLeft - startPositive + defaultExpBucketWidth + xWidthNegative - adjust) / (xWidthTotal - adjust)) *
-                  100 +
+                ((xWidthNegative + defaultExpBucketWidth + positiveOffset - adjust) / (xWidthTotal - adjust)) * 100 +
                 '%';
             }
 
@@ -275,6 +291,14 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
               // do not render zero width zero bucket
               bucketLeft = '0%';
               bucketWidth = '0%';
+            }
+
+            // Clamp bucket position to ensure it stays within 0-100%
+            const leftPercent = parseFloat(bucketLeft);
+            if (leftPercent < 0) {
+              bucketLeft = '0%';
+            } else if (leftPercent > 100) {
+              bucketLeft = '100%';
             }
 
             bucketHeight = (count / countMax) * 100 + '%';

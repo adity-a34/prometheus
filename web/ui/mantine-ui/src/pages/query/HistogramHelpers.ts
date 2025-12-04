@@ -214,6 +214,7 @@ export function classifyBucket(left: number, right: number): BucketType {
 }
 
 // Safely calculates log value, handling 0 and Inf cases
+// For exponential view, this creates logarithmic spacing with symmetry around zero
 export function safeLog(value: number, isNegative = false): number {
   if (value === 0) {
     // For zero, use a small positive value to avoid -Inf
@@ -230,7 +231,18 @@ export function safeLog(value: number, isNegative = false): number {
   }
   const absValue = Math.abs(value);
   const logValue = Math.log(absValue);
-  return isNegative ? -logValue : logValue;
+
+  // For exponential view, negative values should have NEGATIVE log position
+  // This creates symmetry: -10 maps to -log(10), -1 maps to -log(1)=0
+  // And positive values map to positive log: 1 maps to log(1)=0, 10 maps to log(10)
+  // This ensures logarithmic spacing on both sides of zero
+  if (isNegative && value < 0) {
+    // For negative values in negative range: return -log(abs(value))
+    // This puts -10 further left than -1 on exponential scale
+    return -logValue;
+  }
+
+  return logValue;
 }
 
 // Calculates exponential bucket width, handling special cases
