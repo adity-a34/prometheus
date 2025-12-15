@@ -20,11 +20,11 @@ import badgeClasses from "../Badge.module.css";
 import panelClasses from "../Panel.module.css";
 import RuleDefinition from "../components/RuleDefinition";
 import { humanizeDurationRelative, now } from "../lib/formatTime";
-import { Fragment, useEffect, useMemo } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { StateMultiSelect } from "../components/StateMultiSelect";
 import { IconInfoCircle, IconSearch } from "@tabler/icons-react";
 import { LabelBadges } from "../components/LabelBadges";
-import { useLocalStorage } from "@mantine/hooks";
+import { useDebouncedValue, useLocalStorage } from "@mantine/hooks";
 import { useSettings } from "../state/settingsSlice";
 import {
   ArrayParam,
@@ -33,7 +33,6 @@ import {
   useQueryParam,
   withDefault,
 } from "use-query-params";
-import { useDebouncedValue } from "@mantine/hooks";
 import { KVSearch } from "@nexucis/kvsearch";
 import { inputIconStyle } from "../styles";
 import CustomInfiniteScroll from "../components/CustomInfiniteScroll";
@@ -172,7 +171,57 @@ export default function AlertsPage() {
     "search",
     withDefault(StringParam, "")
   );
-  const [debouncedSearch] = useDebouncedValue<string>(searchFilter.trim(), 250);
+
+  // Local state for IME-safe input (immediate visual feedback)
+  const [localSearch, setLocalSearch] = useState(searchFilter || "");
+
+  // Track IME composition state to prevent interruption
+  const [isComposing, setIsComposing] = useState(false);
+
+  // Sync external URL changes back to local state (browser back/forward, direct URL edits).
+  useEffect(() => {
+    if (searchFilter !== localSearch && !isComposing) {
+      setLocalSearch(searchFilter || "");
+    }
+    // localSearch is intentionally omitted from the dependency array. This effect should only
+    // run when the URL search param changes, to update the local input state. Including
+    // localSearch would cause the user's input to be overwritten.
+  }, [searchFilter, isComposing]);
+
+  // Debounce local search before syncing to URL and using it for filtering.
+  const [debouncedSearch] = useDebouncedValue<string>(
+    (localSearch || "").trim(),
+    250
+  );
+
+  // Update URL only when not composing and after debounce period.
+  useEffect(() => {
+    if (!isComposing && debouncedSearch !== searchFilter) {
+      setSearchFilter(debouncedSearch || null);
+    }
+  }, [debouncedSearch, isComposing, searchFilter, setSearchFilter]);
+
+  // Handle input changes with immediate local state update.
+  const handleSearchChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      setLocalSearch(event.currentTarget.value || "");
+    },
+    []
+  );
+
+  // Handle IME composition lifecycle.
+  const handleCompositionStart = useCallback(() => {
+    setIsComposing(true);
+  }, []);
+
+  const handleCompositionEnd = useCallback(
+    (event: React.CompositionEvent<HTMLInputElement>) => {
+      setIsComposing(false);
+      // Ensure final composed value is captured.
+      setLocalSearch(event.currentTarget.value || "");
+    },
+    []
+  );
   const [showEmptyGroups, setShowEmptyGroups] = useLocalStorage<boolean>({
     key: "alertsPage.showEmptyGroups",
     defaultValue: false,
@@ -449,10 +498,10 @@ export default function AlertsPage() {
           flex={1}
           leftSection={<IconSearch style={inputIconStyle} />}
           placeholder="Filter by rule name or labels"
-          value={searchFilter || ""}
-          onChange={(event) =>
-            setSearchFilter(event.currentTarget.value || null)
-          }
+          value={localSearch}
+          onChange={handleSearchChange}
+          onCompositionStart={handleCompositionStart}
+          onCompositionEnd={handleCompositionEnd}
         ></TextInput>
       </Group>
       {alertsPageData.groups.length === 0 ? (
