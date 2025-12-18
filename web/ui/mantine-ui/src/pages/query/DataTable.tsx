@@ -1,4 +1,4 @@
-import { FC, ReactNode, useState } from "react";
+import { FC, ReactNode, useEffect, useMemo, useState } from "react";
 import {
   Table,
   Alert,
@@ -23,7 +23,7 @@ import timezone from "dayjs/plugin/timezone";
 import { formatTimestamp } from "../../lib/formatTime";
 import HistogramChart from "./HistogramChart";
 import { Histogram } from "../../types/types";
-import { bucketRangeString } from "./HistogramHelpers";
+import { bucketRangeString, shouldDefaultToLinear, extractNHCBBuckets, FloatHistogram } from "./HistogramHelpers";
 import { useSettings } from "../../state/settingsSlice";
 dayjs.extend(timezone);
 
@@ -51,10 +51,38 @@ const DataTable: FC<DataTableProps> = ({
   limitResults,
   setLimitResults,
 }) => {
-  const [scale, setScale] = useState<string>("exponential");
   const { useLocalTime } = useSettings();
 
   const { result, resultType } = data;
+  const firstHistogram = useMemo(() => {
+    if (!result || result.length === 0) {
+      return undefined;
+    }
+    if (resultType === "vector") {
+      const item = (result as InstantSample[]).find((s): s is InstantSample & {histogram: [number, Histogram]} => 
+        'histogram' in s && s.histogram !== undefined
+      );
+      return item?.histogram[1] ?? undefined;
+    }
+    if (resultType === "matrix") {
+      const item = (result as RangeSamples[]).find((s) => s.histograms && s.histograms.length > 0);
+      return item ? item.histograms![0][1] : undefined;
+    }
+    return undefined;
+  }, [result, resultType]);
+
+  const defaultScale = useMemo(() => {
+    if (firstHistogram && shouldDefaultToLinear(firstHistogram as FloatHistogram)) {
+      return "linear";
+    }
+    return "exponential";
+  }, [firstHistogram]);
+
+  const [scale, setScale] = useState<string>(defaultScale);
+
+  useEffect(() => {
+    setScale(defaultScale);
+  }, [defaultScale]);
   const doFormat = result.length <= maxFormattableSeries;
 
   return (
@@ -195,7 +223,7 @@ const histogramTable = (h: Histogram): ReactNode => (
         <Table.Th>Count</Table.Th>
       </Table.Tr>
       <ScrollArea w={"100%"} h={265}>
-        {h.buckets?.map((b, i) => (
+        {getDisplayBuckets(h).map((b, i) => (
           <Table.Tr key={i}>
             <Table.Td style={{ textAlign: "left" }}>
               {bucketRangeString(b)}
@@ -207,5 +235,25 @@ const histogramTable = (h: Histogram): ReactNode => (
     </Table.Tbody>
   </Table>
 );
+
+const getDisplayBuckets = (h: Histogram): [number, string, string, string][] => {
+  if (h.buckets && h.buckets.length > 0) {
+    return h.buckets;
+  }
+  try {
+    interface NativeHistogram extends Histogram {
+      schema: number;
+      positiveBuckets?: unknown;
+      negativeBuckets?: unknown;
+    }
+    
+    if ('schema' in h && (h as NativeHistogram).schema === -53) {
+      return extractNHCBBuckets(h as NativeHistogram);
+    }
+  } catch (error) {
+    console.error("Failed to extract NHCB buckets:", error);
+  }
+  return [];
+};
 
 export default DataTable;

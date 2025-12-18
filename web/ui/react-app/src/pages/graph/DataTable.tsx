@@ -1,9 +1,10 @@
-import React, { FC, ReactNode } from 'react';
+import React, { FC, ReactNode, useEffect, useMemo } from 'react';
 
 import { Alert, Button, ButtonGroup, Table } from 'reactstrap';
 
 import SeriesName from './SeriesName';
 import { Metric, Histogram } from '../../types/types';
+import { ScaleType, shouldDefaultToLinear, extractNHCBBuckets } from './HistogramHelpers';
 
 import moment from 'moment';
 
@@ -56,7 +57,33 @@ const limitSeries = <S extends InstantSample | RangeSamples>(series: S[]): S[] =
 };
 
 const DataTable: FC<DataTableProps> = ({ data, useLocalTime }) => {
-  const [scale, setScale] = React.useState<'linear' | 'exponential'>('exponential');
+  const firstHistogram = useMemo(() => {
+    if (!data || !data.result) {
+      return undefined;
+    }
+    if (data.resultType === 'vector') {
+      const item = (data.result as InstantSample[]).find((s) => (s as any).histogram);
+      return item ? (item as any).histogram[1] : undefined;
+    }
+    if (data.resultType === 'matrix') {
+      const item = (data.result as RangeSamples[]).find((s) => s.histograms && s.histograms.length > 0);
+      return item ? item.histograms![0][1] : undefined;
+    }
+    return undefined;
+  }, [data]);
+
+  const defaultScale: ScaleType = useMemo(() => {
+    if (firstHistogram && shouldDefaultToLinear(firstHistogram as any)) {
+      return 'linear';
+    }
+    return 'exponential';
+  }, [firstHistogram]);
+
+  const [scale, setScale] = React.useState<ScaleType>(defaultScale);
+
+  useEffect(() => {
+    setScale(defaultScale);
+  }, [defaultScale]);
 
   if (data === null) {
     return <Alert color="light">No data queried yet</Alert>;
@@ -210,6 +237,21 @@ export const bucketRangeString = ([boundaryRule, leftBoundary, rightBoundary, _]
   return `${leftDelim(boundaryRule)}${leftBoundary} -> ${rightBoundary}${rightDelim(boundaryRule)}`;
 };
 
+const getDisplayBuckets = (h: Histogram): [number, string, string, string][] => {
+  if (h.buckets && h.buckets.length > 0) {
+    return h.buckets;
+  }
+  try {
+    if ((h as any).schema === -53) {
+      return extractNHCBBuckets(h as any);
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('Failed to extract NHCB buckets:', error);
+  }
+  return [];
+};
+
 export const histogramTable = (h: Histogram): ReactNode => (
   <Table size="xs" responsive bordered>
     <thead>
@@ -224,7 +266,7 @@ export const histogramTable = (h: Histogram): ReactNode => (
         <th>Range</th>
         <th>Count</th>
       </tr>
-      {h.buckets?.map((b, i) => (
+      {getDisplayBuckets(h).map((b, i) => (
         <tr key={i}>
           <td>{bucketRangeString(b)}</td>
           <td>{b[3]}</td>

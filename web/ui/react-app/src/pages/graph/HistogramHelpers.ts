@@ -1,5 +1,31 @@
 export type ScaleType = 'linear' | 'exponential';
 
+// Constants for special value handling in exponential rendering
+const ZERO_SUBSTITUTE_LOG = Math.log(1e-10); // Used in safeLog for value = 0
+const INF_LOG_VALUE = 20; // Used in safeLog for ±Inf
+const INF_BUCKET_WIDTH_MULTIPLIER = 1.5; // Width multiplier for ±Inf buckets
+const ZERO_CROSSING_WIDTH_MULTIPLIER = 1.2; // Width multiplier for zero-crossing buckets
+const ZERO_ADJACENT_SUBSTITUTE = 1e-3; // Substitute for 0 in [0, x] buckets (instead of 1e-10)
+
+// Float histogram interfaces used for NHCB detection/extraction (issue #16582)
+export interface Span {
+  offset: number;
+  length: number;
+}
+
+export interface FloatHistogram {
+  schema: number;
+  count: number;
+  sum: number;
+  customValues?: number[];
+  positiveBuckets?: number[];
+  negativeBuckets?: number[];
+  positiveSpans?: Span[];
+  negativeSpans?: Span[];
+  zeroThreshold?: number;
+  zeroCount?: number;
+}
+
 // Calculates a default width of exponential histogram bucket ranges. If the last bucket is [0, 0],
 // the width is calculated using the second to last bucket. returns error if the last bucket is [-0, 0],
 export function calculateDefaultExpBucketWidth(
@@ -169,6 +195,76 @@ export function validateHistogramBuckets(buckets: [number, string, string, strin
   return null;
 }
 
+/**
+ * Detects the histogram schema type.
+ * Schema -53 = NHCB (custom buckets); 0-8 = exponential schemas.
+ */
+export function detectHistogramSchema(histogram: FloatHistogram): { type: 'nhcb' | 'exponential'; schema: number } {
+  if (histogram.schema === -53) {
+    return { type: 'nhcb', schema: -53 };
+  }
+  return { type: 'exponential', schema: histogram.schema || 0 };
+}
+
+/**
+ * Determines if histogram should default to linear scale.
+ * NHCB histograms MUST default to linear
+ */
+export function shouldDefaultToLinear(histogram: FloatHistogram): boolean {
+  return histogram.schema === -53;
+}
+
+/**
+ * Extracts NHCB buckets and converts cumulative counts to per-bucket counts.
+ * Validates schema, customValues ordering, and adds overflow bucket if needed.
+ * Returns buckets in the same tuple format as exponential histograms.
+ */
+export function extractNHCBBuckets(histogram: FloatHistogram): [number, string, string, string][] {
+  if (histogram.schema !== -53) {
+    throw new Error('extractNHCBBuckets called for non-NHCB histogram');
+  }
+  if (!histogram.customValues || histogram.customValues.length === 0) {
+    throw new Error('Invalid NHCB histogram: missing customValues');
+  }
+
+  const customValues = histogram.customValues;
+  for (let i = 1; i < customValues.length; i++) {
+    if (!(customValues[i] > customValues[i - 1])) {
+      throw new Error('Invalid NHCB histogram: customValues must be strictly increasing');
+    }
+  }
+
+  const cumulativeCounts = histogram.positiveBuckets || [];
+  const totalCount = histogram.count ?? 0;
+  const buckets: [number, string, string, string][] = [];
+
+  let prevCumulativeCount = 0;
+  let prevUpperBound = -Infinity;
+
+  for (let i = 0; i < customValues.length; i++) {
+    const upperBound = customValues[i];
+    const cumulativeCount = cumulativeCounts[i] ?? 0;
+    const count = cumulativeCount - prevCumulativeCount;
+
+    buckets.push([i, prevUpperBound.toString(), upperBound.toString(), count.toString()]);
+
+    prevCumulativeCount = cumulativeCount;
+    prevUpperBound = upperBound;
+  }
+
+  // Add overflow bucket if total count exceeds last cumulative
+  if (prevCumulativeCount < totalCount) {
+    buckets.push([
+      customValues.length,
+      prevUpperBound.toString(),
+      'Infinity',
+      (totalCount - prevCumulativeCount).toString(),
+    ]);
+  }
+
+  return buckets;
+}
+
 // Classifies a bucket type for exponential rendering
 export type BucketType =
   | 'normal'
@@ -216,15 +312,15 @@ export function classifyBucket(left: number, right: number): BucketType {
 export function safeLog(value: number, isNegative = false): number {
   if (value === 0) {
     // For zero, use a small positive value to avoid -Inf
-    return Math.log(1e-10);
+    return ZERO_SUBSTITUTE_LOG;
   }
   if (!isFinite(value)) {
     if (value > 0) {
       // +Inf: use a large value
-      return 20; // log(1e8) ≈ 18.4, using 20 as reasonable upper bound
+      return INF_LOG_VALUE; // log(1e8) ≈ 18.4, using 20 as reasonable upper bound
     } else {
       // -Inf: use a large negative value
-      return -20;
+      return -INF_LOG_VALUE;
     }
   }
   const absValue = Math.abs(value);
@@ -257,33 +353,28 @@ export function calculateExpBucketWidth(
   }
 
   if (bucketType === 'zero-crossing') {
-    // Use reasonable width: min of absolute values converted to log scale
-    const minAbs = Math.min(Math.abs(left), Math.abs(right));
-    if (minAbs === 0) {
-      return defaultExpBucketWidth;
-    }
-    // Calculate width based on the smaller absolute value
-    // This gives a reasonable width without infinite log scale issues
-    const logMinAbs = Math.log(minAbs);
-    // Use a reasonable multiplier to make it visible
-    return Math.max(defaultExpBucketWidth, Math.abs(logMinAbs) * 0.5);
+    // Use fixed multiplier for predictable, reasonable width
+    return defaultExpBucketWidth * ZERO_CROSSING_WIDTH_MULTIPLIER;
   }
 
   if (bucketType === 'inf-left' || bucketType === 'inf-right') {
     // Use 1.5x the widest regular bucket or 10-15% of viewport (approximated as 1.5x default)
-    return defaultExpBucketWidth * 1.5;
+    return defaultExpBucketWidth * INF_BUCKET_WIDTH_MULTIPLIER;
   }
 
   if (bucketType === 'zero-adjacent-left') {
-    // For [0, x], treat 0 as small positive value
+    // For [0, x], use a less extreme substitute for zero
+    if (right <= ZERO_ADJACENT_SUBSTITUTE) {
+      return defaultExpBucketWidth;
+    }
     const logRight = safeLog(right, false);
-    const logLeft = safeLog(0, false); // Will use 1e-10 internally
+    const logLeft = Math.log(ZERO_ADJACENT_SUBSTITUTE);
     return Math.abs(logRight - logLeft);
   }
 
   if (bucketType === 'zero-adjacent-right') {
     // For [x, 0], treat 0 as small positive value
-    const logRight = safeLog(0, false); // Will use 1e-10 internally
+    const logRight = Math.log(ZERO_ADJACENT_SUBSTITUTE);
     const logLeft = safeLog(left, true);
     return Math.abs(logRight - logLeft);
   }

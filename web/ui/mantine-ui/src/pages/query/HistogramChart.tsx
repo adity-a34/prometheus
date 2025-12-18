@@ -1,6 +1,8 @@
-import React, { FC } from "react";
+import React, { FC, useMemo } from "react";
 import { Histogram } from "../../types/types";
 import {
+  detectHistogramSchema,
+  extractNHCBBuckets,
   calculateDefaultExpBucketWidth,
   findMinPositive,
   findMaxNegative,
@@ -15,7 +17,7 @@ import {
   formatBoundary,
 } from "./HistogramHelpers";
 import classes from "./HistogramChart.module.css";
-import { Tooltip } from "@mantine/core";
+import { Tooltip, Alert } from "@mantine/core";
 
 interface HistogramChartProps {
   histogram: Histogram;
@@ -28,15 +30,47 @@ const HistogramChart: FC<HistogramChartProps> = ({
   histogram,
   scale,
 }) => {
-  const { buckets } = histogram;
-  if (!buckets || buckets.length === 0) {
-    return <div>No data</div>;
+  interface NativeHistogram extends Histogram {
+    schema?: number;
+    positiveBuckets?: unknown;
+    negativeBuckets?: unknown;
   }
+  
+  const histogramSchema = useMemo(() => 
+    detectHistogramSchema(histogram as NativeHistogram), [histogram]);
+  const { processedBuckets, extractionError } = useMemo(() => {
+    try {
+      if (histogramSchema.type === "nhcb") {
+        return { processedBuckets: extractNHCBBuckets(histogram as NativeHistogram), extractionError: null };
+      }
+      return { processedBuckets: histogram.buckets || [], extractionError: null };
+    } catch (e) {
+      return { processedBuckets: [], extractionError: (e as Error).message };
+    }
+  }, [histogram, histogramSchema]);
+
+  if (extractionError) {
+    return (
+      <Alert color="red" title="Invalid Histogram" mt="sm">
+        {extractionError}
+      </Alert>
+    );
+  }
+
+  if (!processedBuckets || processedBuckets.length === 0) {
+    return <Alert color="gray">No data</Alert>;
+  }
+
+  const buckets = processedBuckets;
 
   // Validate histogram buckets
   const validationError = validateHistogramBuckets(buckets);
   if (validationError) {
-    return <div style={{ padding: '10px', color: 'red' }}>{validationError}</div>;
+    return (
+      <Alert color="red" title="Invalid Histogram" mt="sm">
+        {validationError}
+      </Alert>
+    );
   }
 
   const formatter = Intl.NumberFormat("en", { notation: "compact" });
@@ -102,6 +136,20 @@ const HistogramChart: FC<HistogramChartProps> = ({
 
   return (
     <div className={classes.histogramYWrapper}>
+      {histogramSchema.type === "nhcb" && scale === "exponential" && (
+        <div
+          style={{
+            padding: "8px 12px",
+            backgroundColor: "#fff3cd",
+            border: "1px solid #ffc107",
+            borderRadius: "4px",
+            marginBottom: "8px",
+            fontSize: "14px",
+          }}
+        >
+          ℹ️ Custom bucket histogram (NHCB). Linear scale is recommended for accurate visualization.
+        </div>
+      )}
       <div className={classes.histogramYLabels}>
         {[1, 0.75, 0.5, 0.25].map((i) => (
           <div key={i} className={classes.histogramYLabel}>
@@ -246,6 +294,9 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
             break;
           }
           case "exponential": {
+            // Classify using ORIGINAL boundaries before clamping
+            const bucketType = classifyBucket(left, right);
+
             // Clamp bucket boundaries to visible range for positioning calculations
             const clampedLeft = Math.max(left, rangeMin);
             const clampedRight = Math.min(right, rangeMax);
@@ -257,8 +308,6 @@ const RenderHistogramBars: FC<RenderHistogramProps> = ({
               bucketHeight = '0%';
               break;
             }
-
-            const bucketType = classifyBucket(clampedLeft, clampedRight);
 
             // Skip invalid buckets
             if (bucketType === 'invalid') {
