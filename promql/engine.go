@@ -2191,8 +2191,8 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 					mat[i].Histograms[j].H = mat[i].Histograms[j].H.Copy().Mul(-1)
 				}
 			}
-			if !ev.enableDelayedNameRemoval && mat.ContainsSameLabelset() {
-				ev.errorf("vector cannot contain metrics with the same labelset")
+			if !ev.enableDelayedNameRemoval {
+				mat = ev.mergeSeriesWithSameLabelset(mat)
 			}
 		}
 		return mat, ws
@@ -4057,7 +4057,7 @@ func unwrapStepInvariantExpr(e parser.Expr) parser.Expr {
 func PreprocessExpr(expr parser.Expr, start, end time.Time, step time.Duration) (parser.Expr, error) {
 	detectHistogramStatsDecoding(expr)
 
-	if err := parser.Walk(&durationVisitor{step: step}, expr, nil); err != nil {
+	if err := parser.Walk(&durationVisitor{step: step, queryRange: end.Sub(start)}, expr, nil); err != nil {
 		return nil, err
 	}
 
