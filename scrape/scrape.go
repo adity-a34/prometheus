@@ -324,12 +324,12 @@ func (sp *scrapePool) restartLoops(reuseCache bool) {
 
 	forcedErr := sp.refreshTargetLimitErr()
 	for fp, oldLoop := range sp.loops {
-		var cache *scrapeCache
+		var cache scrapeCache
 		if oc := oldLoop.getCache(); reuseCache && oc != nil {
 			oldLoop.disableEndOfRunStalenessMarkers()
 			cache = oc
 		} else {
-			cache = newScrapeCache(sp.metrics)
+			cache = newScrapeCache(sp.metrics, sp.options.UseTrieCache)
 		}
 
 		t := sp.activeTargets[fp]
@@ -473,7 +473,7 @@ func (sp *scrapePool) sync(targets []*Target) {
 					acceptEncodingHeader: acceptEncodingHeader(sp.config.EnableCompression),
 					metrics:              sp.metrics,
 				},
-				cache:    newScrapeCache(sp.metrics),
+				cache:    newScrapeCache(sp.metrics, sp.options.UseTrieCache),
 				interval: targetInterval,
 				timeout:  targetTimeout,
 				sp:       sp,
@@ -817,7 +817,7 @@ type loop interface {
 	setForcedError(err error)
 	setScrapeFailureLogger(FailureLogger)
 	stop()
-	getCache() *scrapeCache
+	getCache() scrapeCache
 	disableEndOfRunStalenessMarkers()
 }
 
@@ -836,7 +836,7 @@ type scrapeLoop struct {
 	parentCtx   context.Context
 	appenderCtx context.Context
 	l           *slog.Logger
-	cache       *scrapeCache
+	cache       scrapeCache
 
 	interval            time.Duration
 	timeout             time.Duration
@@ -889,11 +889,32 @@ type scrapeLoop struct {
 	disabledEndOfRunStalenessMarkers atomic.Bool
 }
 
-// scrapeCache tracks mappings of exposed metric strings to label sets and
+// scrapeCache is the interface for scrape cache implementations.
+// It tracks mappings of exposed metric strings to label sets and
 // storage references. Additionally, it tracks staleness of series between
 // scrapes.
 // Cache is meant to be used per a single target.
-type scrapeCache struct {
+type scrapeCache interface {
+	iterDone(flushCache bool)
+	get(met []byte) (*cacheEntry, bool, bool)
+	addRef(met []byte, ref storage.SeriesRef, lset labels.Labels, hash uint64) *cacheEntry
+	addDropped(met []byte)
+	getDropped(met []byte) bool
+	trackStaleness(ref storage.SeriesRef, ce *cacheEntry)
+	forEachStale(f func(storage.SeriesRef, labels.Labels) bool)
+	setType(mfName []byte, t model.MetricType) ([]byte, *metaEntry)
+	setHelp(mfName, help []byte) ([]byte, *metaEntry)
+	setUnit(mfName, unit []byte) ([]byte, *metaEntry)
+	GetMetadata(mfName string) (MetricMetadata, bool)
+	ListMetadata() []MetricMetadata
+	SizeMetadata() int
+	LengthMetadata() int
+	getIter() uint64
+}
+
+// mapScrapeCache is the map-based implementation of scrapeCache.
+// It uses Go maps with full metric strings as keys.
+type mapScrapeCache struct {
 	iter uint64 // Current scrape iteration.
 
 	// How many series and metadata entries there were at the last success.
@@ -932,8 +953,15 @@ func (m *metaEntry) size() int {
 	return len(m.Help) + len(m.Unit) + len(m.Type)
 }
 
-func newScrapeCache(metrics *scrapeMetrics) *scrapeCache {
-	return &scrapeCache{
+func newScrapeCache(metrics *scrapeMetrics, useTrieCache bool) scrapeCache {
+	if useTrieCache {
+		return newTrieScrapeCache(metrics)
+	}
+	return newMapScrapeCache(metrics)
+}
+
+func newMapScrapeCache(metrics *scrapeMetrics) *mapScrapeCache {
+	return &mapScrapeCache{
 		series:        map[string]*cacheEntry{},
 		droppedSeries: map[string]*uint64{},
 		seriesCur:     map[storage.SeriesRef]*cacheEntry{},
@@ -943,7 +971,7 @@ func newScrapeCache(metrics *scrapeMetrics) *scrapeCache {
 	}
 }
 
-func (c *scrapeCache) iterDone(flushCache bool) {
+func (c *mapScrapeCache) iterDone(flushCache bool) {
 	c.metaMtx.Lock()
 	count := len(c.series) + len(c.droppedSeries) + len(c.metadata)
 	c.metaMtx.Unlock()
@@ -992,7 +1020,7 @@ func (c *scrapeCache) iterDone(flushCache bool) {
 	c.iter++
 }
 
-func (c *scrapeCache) get(met []byte) (*cacheEntry, bool, bool) {
+func (c *mapScrapeCache) get(met []byte) (*cacheEntry, bool, bool) {
 	e, ok := c.series[string(met)]
 	if !ok {
 		return nil, false, false
@@ -1002,7 +1030,7 @@ func (c *scrapeCache) get(met []byte) (*cacheEntry, bool, bool) {
 	return e, true, alreadyScraped
 }
 
-func (c *scrapeCache) addRef(met []byte, ref storage.SeriesRef, lset labels.Labels, hash uint64) (ce *cacheEntry) {
+func (c *mapScrapeCache) addRef(met []byte, ref storage.SeriesRef, lset labels.Labels, hash uint64) (ce *cacheEntry) {
 	if ref == 0 {
 		return nil
 	}
@@ -1011,12 +1039,12 @@ func (c *scrapeCache) addRef(met []byte, ref storage.SeriesRef, lset labels.Labe
 	return ce
 }
 
-func (c *scrapeCache) addDropped(met []byte) {
+func (c *mapScrapeCache) addDropped(met []byte) {
 	iter := c.iter
 	c.droppedSeries[string(met)] = &iter
 }
 
-func (c *scrapeCache) getDropped(met []byte) bool {
+func (c *mapScrapeCache) getDropped(met []byte) bool {
 	iterp, ok := c.droppedSeries[string(met)]
 	if ok {
 		*iterp = c.iter
@@ -1024,11 +1052,11 @@ func (c *scrapeCache) getDropped(met []byte) bool {
 	return ok
 }
 
-func (c *scrapeCache) trackStaleness(ref storage.SeriesRef, ce *cacheEntry) {
+func (c *mapScrapeCache) trackStaleness(ref storage.SeriesRef, ce *cacheEntry) {
 	c.seriesCur[ref] = ce
 }
 
-func (c *scrapeCache) forEachStale(f func(storage.SeriesRef, labels.Labels) bool) {
+func (c *mapScrapeCache) forEachStale(f func(storage.SeriesRef, labels.Labels) bool) {
 	for ref, ce := range c.seriesPrev {
 		if _, ok := c.seriesCur[ref]; !ok {
 			if !f(ce.ref, ce.lset) {
@@ -1042,7 +1070,7 @@ func yoloString(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-func (c *scrapeCache) setType(mfName []byte, t model.MetricType) ([]byte, *metaEntry) {
+func (c *mapScrapeCache) setType(mfName []byte, t model.MetricType) ([]byte, *metaEntry) {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -1059,7 +1087,7 @@ func (c *scrapeCache) setType(mfName []byte, t model.MetricType) ([]byte, *metaE
 	return mfName, e
 }
 
-func (c *scrapeCache) setHelp(mfName, help []byte) ([]byte, *metaEntry) {
+func (c *mapScrapeCache) setHelp(mfName, help []byte) ([]byte, *metaEntry) {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -1076,7 +1104,7 @@ func (c *scrapeCache) setHelp(mfName, help []byte) ([]byte, *metaEntry) {
 	return mfName, e
 }
 
-func (c *scrapeCache) setUnit(mfName, unit []byte) ([]byte, *metaEntry) {
+func (c *mapScrapeCache) setUnit(mfName, unit []byte) ([]byte, *metaEntry) {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -1094,7 +1122,7 @@ func (c *scrapeCache) setUnit(mfName, unit []byte) ([]byte, *metaEntry) {
 }
 
 // GetMetadata returns metadata given the metric family name.
-func (c *scrapeCache) GetMetadata(mfName string) (MetricMetadata, bool) {
+func (c *mapScrapeCache) GetMetadata(mfName string) (MetricMetadata, bool) {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -1111,7 +1139,7 @@ func (c *scrapeCache) GetMetadata(mfName string) (MetricMetadata, bool) {
 }
 
 // ListMetadata lists metadata.
-func (c *scrapeCache) ListMetadata() []MetricMetadata {
+func (c *mapScrapeCache) ListMetadata() []MetricMetadata {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -1129,7 +1157,7 @@ func (c *scrapeCache) ListMetadata() []MetricMetadata {
 }
 
 // SizeMetadata returns the size of the metadata cache.
-func (c *scrapeCache) SizeMetadata() (s int) {
+func (c *mapScrapeCache) SizeMetadata() (s int) {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 	for _, e := range c.metadata {
@@ -1140,18 +1168,23 @@ func (c *scrapeCache) SizeMetadata() (s int) {
 }
 
 // LengthMetadata returns the number of metadata entries in the cache.
-func (c *scrapeCache) LengthMetadata() int {
+func (c *mapScrapeCache) LengthMetadata() int {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
 	return len(c.metadata)
 }
 
+// getIter returns the current scrape iteration.
+func (c *mapScrapeCache) getIter() uint64 {
+	return c.iter
+}
+
 // scrapeLoopOptions contains static options that do not change per scrapePool lifecycle.
 type scrapeLoopOptions struct {
 	target            *Target
 	scraper           scraper
-	cache             *scrapeCache
+	cache             scrapeCache
 	interval, timeout time.Duration
 
 	sp *scrapePool
@@ -1531,7 +1564,7 @@ func (sl *scrapeLoop) disableEndOfRunStalenessMarkers() {
 	sl.disabledEndOfRunStalenessMarkers.Store(true)
 }
 
-func (sl *scrapeLoop) getCache() *scrapeCache {
+func (sl *scrapeLoop) getCache() scrapeCache {
 	return sl.cache
 }
 
@@ -1833,7 +1866,7 @@ loop:
 
 		if sl.appendMetadataToWAL && lastMeta != nil {
 			// Is it new series OR did metadata change for this family?
-			if !seriesCached || lastMeta.lastIterChange == sl.cache.iter {
+			if !seriesCached || lastMeta.lastIterChange == sl.cache.getIter() {
 				// In majority cases we can trust that the current series/histogram is matching the lastMeta and lastMFName.
 				// However, optional TYPE etc metadata and broken OM text can break this, detect those cases here.
 				// TODO(https://github.com/prometheus/prometheus/issues/17900): Move this to text and OM parser.

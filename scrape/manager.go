@@ -120,6 +120,11 @@ type Options struct {
 	// EnableTypeAndUnitLabels represents type-and-unit-labels feature flag.
 	EnableTypeAndUnitLabels bool
 
+	// UseTrieCache enables memory-efficient trie-based scrape cache
+	// instead of map-based cache. Reduces memory usage for targets
+	// with many similar metric names.
+	UseTrieCache bool
+
 	// Optional HTTP client options to use when scraping.
 	HTTPClientOptions []config_util.HTTPClientOption
 

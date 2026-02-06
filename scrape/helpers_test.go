@@ -85,7 +85,7 @@ func newTestScrapeLoop(t testing.TB, opts ...func(sl *scrapeLoop)) (_ *scrapeLoo
 		stopped: make(chan struct{}),
 
 		l:     promslog.NewNopLogger(),
-		cache: newScrapeCache(metrics),
+		cache: newScrapeCache(metrics, false),
 
 		interval:            10 * time.Millisecond,
 		timeout:             1 * time.Hour,

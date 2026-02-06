@@ -473,7 +473,7 @@ func (l *testLoop) stop() {
 	l.stopFunc()
 }
 
-func (*testLoop) getCache() *scrapeCache {
+func (*testLoop) getCache() scrapeCache {
 	return nil
 }
 
@@ -2215,14 +2215,14 @@ func testScrapeLoopCache(t *testing.T, appV2 bool) {
 	scraper.scrapeFunc = func(_ context.Context, w io.Writer) error {
 		switch numScrapes {
 		case 1, 2:
-			_, ok := sl.cache.series["metric_a"]
+			_, ok, _ := sl.cache.get([]byte("metric_a"))
 			require.True(t, ok, "metric_a missing from cache after scrape %d", numScrapes)
-			_, ok = sl.cache.series["metric_b"]
+			_, ok, _ = sl.cache.get([]byte("metric_b"))
 			require.True(t, ok, "metric_b missing from cache after scrape %d", numScrapes)
 		case 3:
-			_, ok := sl.cache.series["metric_a"]
+			_, ok, _ := sl.cache.get([]byte("metric_a"))
 			require.True(t, ok, "metric_a missing from cache after scrape %d", numScrapes)
-			_, ok = sl.cache.series["metric_b"]
+			_, ok, _ = sl.cache.get([]byte("metric_b"))
 			require.False(t, ok, "metric_b present in cache after scrape %d", numScrapes)
 		}
 
@@ -2298,7 +2298,14 @@ func testScrapeLoopCacheMemoryExhaustionProtection(t *testing.T, appV2 bool) {
 		require.FailNow(t, "Scrape wasn't stopped.")
 	}
 
-	require.LessOrEqual(t, len(sl.cache.series), 2000, "More than 2000 series cached.")
+	// Check cache size by counting entries
+	cacheSize := 0
+	if mapCache, ok := sl.cache.(*mapScrapeCache); ok {
+		cacheSize = len(mapCache.series)
+	} else if trieCache, ok := sl.cache.(*trieScrapeCache); ok {
+		cacheSize = trieCache.countTrieEntries(trieCache.seriesRoot)
+	}
+	require.LessOrEqual(t, cacheSize, 2000, "More than 2000 series cached.")
 }
 
 func TestScrapeLoopAppend_HonorLabels(t *testing.T) {
@@ -4473,8 +4480,15 @@ func testScrapeAddFast(t *testing.T, appV2 bool) {
 
 	// Poison the cache. There is just one entry, and one series in the
 	// storage. Changing the ref will create a 'not found' error.
-	for _, v := range sl.getCache().series {
-		v.ref++
+	if mapCache, ok := sl.getCache().(*mapScrapeCache); ok {
+		for _, v := range mapCache.series {
+			v.ref++
+		}
+	} else if trieCache, ok := sl.getCache().(*trieScrapeCache); ok {
+		// For trie cache, we need to walk the trie to find entries
+		trieCache.trieMtx.Lock()
+		poisonTrieEntries(trieCache.seriesRoot)
+		trieCache.trieMtx.Unlock()
 	}
 
 	app = sl.appender()
@@ -6733,4 +6747,17 @@ func testDropsSeriesFromMetricRelabeling(t *testing.T, appV2 bool) {
 	require.Equal(t, 0, seriesAdded)
 
 	require.NoError(t, app.Commit())
+}
+
+// poisonTrieEntries increments refs in all trie entries for testing.
+func poisonTrieEntries(node *trieNode) {
+	if node == nil {
+		return
+	}
+	if node.isEnd && node.entry != nil {
+		node.entry.ref++
+	}
+	for _, child := range node.children {
+		poisonTrieEntries(child)
+	}
 }
